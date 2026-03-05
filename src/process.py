@@ -9,6 +9,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_PATH = RAW_DIR / "telemetry_logs.jsonl"
 EMP_PATH = RAW_DIR / "employees.csv"
 
+
 def parse_cloudwatch_export(jsonl_path: Path) -> pd.DataFrame:
     """
     telemetry_logs.jsonl lines look like CloudWatch Logs export:
@@ -21,6 +22,7 @@ def parse_cloudwatch_export(jsonl_path: Path) -> pd.DataFrame:
             line = line.strip()
             if not line:
                 continue
+
             obj = json.loads(line)
 
             owner = obj.get("owner")
@@ -30,28 +32,32 @@ def parse_cloudwatch_export(jsonl_path: Path) -> pd.DataFrame:
 
             events = obj.get("logEvents", []) or []
             for ev in events:
-                rows.append({
-                    "owner": owner,
-                    "log_group": log_group,
-                    "log_stream": log_stream,
-                    "year": y,
-                    "month": m,
-                    "day": d,
-                    "event_id": ev.get("id"),
-                    "timestamp_ms": ev.get("timestamp"),
-                    "message": ev.get("message"),
-                })
+                rows.append(
+                    {
+                        "owner": owner,
+                        "log_group": log_group,
+                        "log_stream": log_stream,
+                        "year": y,
+                        "month": m,
+                        "day": d,
+                        "event_id": ev.get("id"),
+                        "timestamp_ms": ev.get("timestamp"),
+                        "message": ev.get("message"),
+                    }
+                )
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
+
 
 def extract_fields_from_message(df: pd.DataFrame) -> pd.DataFrame:
     """
-    message is often JSON string; if not, keep raw.
-    We try to parse JSON and extract common analytics fields like:
-    event_type, tokens, session_id, request_type, etc.
+    message is sometimes a JSON string. We try to parse it and flatten.
+    Then we create normalized columns used for analytics:
+    - ts (timestamp)
+    - tokens (fallback to attributes.prompt_length if tokens missing/zero)
+    - email (from attributes.user.email)
+    - session_id (from attributes.session.id)
     """
-    # Try parse message JSON
     parsed = []
     for msg in df["message"].fillna("").astype(str):
         msg = msg.strip()
@@ -64,57 +70,66 @@ def extract_fields_from_message(df: pd.DataFrame) -> pd.DataFrame:
             parsed.append({})
 
     df_msg = pd.json_normalize(parsed)
-    # Merge back
     out = pd.concat([df.reset_index(drop=True), df_msg.reset_index(drop=True)], axis=1)
 
-    # Normalize likely columns
+    # Rename a few common variants (if they exist)
     rename_map = {
-        "email": "email",
-        "user.email": "email",
-        "userEmail": "email",
-        "user_email": "email",
-        "userId": "user_id",
         "sessionId": "session_id",
-        "session_id": "session_id",
         "eventType": "event_type",
-        "event_type": "event_type",
         "token_count": "tokens",
-        "tokens": "tokens",
         "promptTokens": "prompt_tokens",
         "completionTokens": "completion_tokens",
         "projectType": "project_type",
-        "project_type": "project_type",
+        "userEmail": "email",
+        "user.email": "email",
     }
     for k, v in rename_map.items():
         if k in out.columns and v not in out.columns:
             out = out.rename(columns={k: v})
 
-    # If we don't have email in message, derive it from 'owner' if it looks like an email
-    if "email" not in out.columns:
-        out["email"] = None
-    out["email"] = out["email"].fillna(
-        out["owner"].where(out["owner"].astype(str).str.contains("@"), None)
-    )
-
-    # Timestamps
+    # Timestamp
     out["ts"] = pd.to_datetime(out["timestamp_ms"], unit="ms", errors="coerce", utc=True)
 
-    # Tokens fallback: try compute from prompt+completion if present
+    # Email (real one in your dataset)
+    if "attributes.user.email" in out.columns:
+        out["email"] = out["attributes.user.email"]
+    elif "email" not in out.columns:
+        out["email"] = None
+
+    # Session id (real one in your dataset)
+    if "attributes.session.id" in out.columns:
+        out["session_id"] = out["attributes.session.id"]
+    elif "session_id" not in out.columns:
+        out["session_id"] = None
+
+    # Tokens (try direct, then fallback to prompt_length)
     if "tokens" in out.columns:
         out["tokens"] = pd.to_numeric(out["tokens"], errors="coerce").fillna(0)
     else:
         out["tokens"] = 0
 
-    if "prompt_tokens" in out.columns or "completion_tokens" in out.columns:
+    # If prompt/completion tokens exist, use them when tokens are 0
+    if ("prompt_tokens" in out.columns) or ("completion_tokens" in out.columns):
         pt = pd.to_numeric(out.get("prompt_tokens", 0), errors="coerce").fillna(0)
         ct = pd.to_numeric(out.get("completion_tokens", 0), errors="coerce").fillna(0)
+        # fill only where tokens are 0
         out["tokens"] = out["tokens"].where(out["tokens"] != 0, pt + ct)
 
-    out["tokens"] = out["tokens"].fillna(0).astype(int)
+    # Final fallback: prompt_length as proxy if tokens are still all 0
+    if out["tokens"].sum() == 0 and "attributes.prompt_length" in out.columns:
+        out["tokens"] = (
+            pd.to_numeric(out["attributes.prompt_length"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+    else:
+        out["tokens"] = out["tokens"].fillna(0).astype(int)
 
-    # If no event_type, create something from messageType/log_group/etc
-    if "event_type" not in out.columns:
-        out["event_type"] = out.get("messageType", "unknown")
+    # Event type fallback
+    if "attributes.event.name" in out.columns and "event_type" not in out.columns:
+        out["event_type"] = out["attributes.event.name"]
+    elif "event_type" not in out.columns:
+        out["event_type"] = "unknown"
 
     # Time features
     out["date"] = out["ts"].dt.date
@@ -122,37 +137,39 @@ def extract_fields_from_message(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+
 def main():
     df_emp = pd.read_csv(EMP_PATH)
+
     df_raw = parse_cloudwatch_export(LOGS_PATH)
     df = extract_fields_from_message(df_raw)
-    # FIX: email is stored in attributes.user.email
-    if "email" not in df.columns or df["email"].isna().all():
-        if "attributes.user.email" in df.columns:
-            df["email"] = df["attributes.user.email"]
 
-    if "practice" in df.columns:
-        df.groupby("practice", dropna=False)["tokens"].sum().reset_index().sort_values("tokens", ascending=False)\
-            .to_csv(OUT_DIR / "tokens_by_practice.csv", index=False)
+    # Merge with employees by email (employees columns: email, full_name, practice, level, location)
+    df = df.merge(df_emp, on="email", how="left")
 
-    if "location" in df.columns:
-        df.groupby("location", dropna=False)["tokens"].sum().reset_index().sort_values("tokens", ascending=False)\
-            .to_csv(OUT_DIR / "tokens_by_location.csv", index=False)
+    # Save processed events
+    df.to_csv(OUT_DIR / "events_processed.csv", index=False)
 
-    # Usage over time
-    df.groupby("hour", dropna=False)["tokens"].sum().reset_index().sort_values("hour")\
-        .to_csv(OUT_DIR / "tokens_by_hour.csv", index=False)
+    # Aggregates (these exist now for dashboard)
+    df.groupby("level", dropna=False)["tokens"].sum().reset_index().sort_values("tokens", ascending=False).to_csv(
+        OUT_DIR / "tokens_by_level.csv", index=False
+    )
+    df.groupby("practice", dropna=False)["tokens"].sum().reset_index().sort_values("tokens", ascending=False).to_csv(
+        OUT_DIR / "tokens_by_practice.csv", index=False
+    )
+    df.groupby("location", dropna=False)["tokens"].sum().reset_index().sort_values("tokens", ascending=False).to_csv(
+        OUT_DIR / "tokens_by_location.csv", index=False
+    )
 
-    df.groupby("date", dropna=False)["tokens"].sum().reset_index().sort_values("date")\
-        .to_csv(OUT_DIR / "tokens_by_day.csv", index=False)
+    df.groupby("hour", dropna=False)["tokens"].sum().reset_index().sort_values("hour").to_csv(
+        OUT_DIR / "tokens_by_hour.csv", index=False
+    )
+    df.groupby("date", dropna=False)["tokens"].sum().reset_index().sort_values("date").to_csv(
+        OUT_DIR / "tokens_by_day.csv", index=False
+    )
 
-    # Sessions summary if exists, else do by log_stream
-    if "session_id" in df.columns:
-        key = "session_id"
-    else:
-        key = "log_stream"
-
-    sess = df.groupby(key, dropna=False).agg(
+    # Sessions summary
+    sess = df.groupby("session_id", dropna=False).agg(
         events=("message", "count"),
         tokens=("tokens", "sum"),
         users=("email", "nunique"),
@@ -164,7 +181,9 @@ def main():
     print("Saved processed files to:", OUT_DIR.resolve())
     print("Processed events shape:", df.shape)
     print("Non-null emails:", int(df["email"].notna().sum()))
-    print("Example columns:", list(df.columns)[:25])
+    print("Total tokens:", int(df["tokens"].sum()))
+    print("Unique sessions:", int(df["session_id"].nunique()))
+
 
 if __name__ == "__main__":
     main()
