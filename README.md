@@ -133,7 +133,7 @@ Clone the repository:
 
 ```
 git clone https://github.com/cikirose/ajinter.git
-cd claude-code-analytics
+cd aleksandarjankovicintership
 ```
 
 Install dependencies:
