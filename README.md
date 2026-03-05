@@ -4,20 +4,6 @@ An end-to-end analytics platform for processing and visualizing telemetry data g
 
 This project demonstrates how raw telemetry logs can be transformed into actionable insights about developer behavior, AI usage patterns, and token consumption.
 
------------------------------------------------
-"Quick Start"
-    Generate data:
-python3 claude_code_telemetry/generate_fake_data.py --num-users 120 --num-sessions 6000 --days 90
-mkdir -p data/raw
-mv claude_code_telemetry/output/* data/raw/
-    Process:
-cd src
-python3 process.py
-cd ..
-    Run dashboard:
-streamlit run dashboard/app.py
-------------------------------------------------
-
 
 # Overview
 
@@ -133,7 +119,7 @@ Clone the repository:
 
 ```
 git clone https://github.com/cikirose/ajinter.git
-cd aleksandarjankovicintership
+cd ajinter
 ```
 
 Install dependencies:
