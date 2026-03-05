@@ -1,0 +1,15 @@
+# data
+data/raw/
+data/processed/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# mac
+.DS_Store
+
+# streamlit
+.streamlit/
